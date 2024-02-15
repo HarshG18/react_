@@ -1,1 +1,224 @@
+import React, { useState, useEffect, ChangeEvent } from "react";
+import styled from "styled-components";
+import { Button, CircularProgress } from "@material-ui/core";
+import { Contract } from "ethers";
+import { useWallet, useChainSelector, useAppSupplies, useEthersSigner, useAppToast } from "./hooks";
+import { fetchAddressForChain, isChainTestnet, numberWithCommas, prettyEthAddress } from "./utils";
+import { CoinGeckoApi } from "./api";
+import { ChainScanner } from "./scanner";
+import { mainnet, avalanche, fantom, sepolia, avalancheFuji, fantomTestnet } from "./chains";
+import { BurnTxTable } from "./BurnTxTable";
+import { AppIcon, AppChip, AppExtLink, AppTooltip } from "./components";
+import { BurnTxProgress, ToastSeverity } from "./constants";
+
+const DashboardLayoutStyled = styled.div``;
+const TransactionTableStyled = styled.div``;
+
+const BurnPage = () => {
+  const {
+    walletAddress,
+    isWalletConnected,
+    openChainModal,
+    walletChain,
+    openConnectModal,
+  } = useWallet();
+  const { openChainSelector, setOpenChainSelector } = useChainSelector();
+  const { chains: receiveChains } = useWallet();
+  const {
+    supplies,
+    allSupplies,
+    setSuppliesChain,
+    suppliesChain,
+    fetchSupplies,
+  } = useAppSupplies(true);
+  const [burnTransactions, setBurnTransactions] = useState([]);
+  const [burnAmount, setBurnAmount] = useState("");
+  const { toastMsg, toastSev, showToast } = useAppToast();
+  const ethersSigner = useEthersSigner({
+    chainId: walletChain?.id ?? 1, // Assuming default chainId is 1 for mainnet
+  });
+  const [txButton, setTxButton] = useState(BurnTxProgress.default);
+  const [txProgress, setTxProgress] = useState(false);
+  const [burnTxHash, setBurnTxHash] = useState(null);
+  const [coinData, setCoinData] = useState({});
+
+  useEffect(() => {
+    CoinGeckoApi.fetchCoinData()
+      .then((data) => {
+        setCoinData(data?.market_data);
+      })
+      .catch((err) => {
+        console.log(err);
+      });
+  }, []);
+
+  const onChangeBurnAmount = (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.value === "") setBurnAmount("");
+    if (isNaN(parseFloat(e.target.value))) return;
+    setBurnAmount(e.target.value);
+  };
+
+  const refetchTransactions = () => {
+    Promise.all(ChainScanner.fetchAllTxPromises(isChainTestnet(walletChain?.id)))
+      .then((results) => {
+        let res = results.flat();
+        res = ChainScanner.sortOnlyBurnTransactions(res);
+        res = res.sort((a, b) => b.timeStamp - a.timeStamp);
+        setBurnTransactions(res);
+      })
+      .catch((err) => {
+        console.log(err);
+      });
+  };
+
+  const executeBurn = async () => {
+    if (!isWalletConnected) {
+      openConnectModal();
+    }
+    if (burnAmount === "") {
+      console.log("Enter amount to migrate");
+      showToast("Enter amount to migrate", ToastSeverity.warning);
+      return;
+    }
+    const newTokenAddress = fetchAddressForChain(walletChain?.id, "newToken");
+    const oftTokenContract = new Contract(newTokenAddress, [], ethersSigner);
+    let amount = parseFloat(burnAmount);
+    setTxButton(BurnTxProgress.burning);
+    setTxProgress(true);
+    try {
+      const burnTx = await oftTokenContract.burn(amount);
+      setBurnTxHash(burnTx.hash);
+      console.log(burnTx, burnTx.hash);
+      await burnTx.wait();
+      setTxButton(BurnTxProgress.default);
+      setTxProgress(false);
+      refetchTransactions();
+      fetchSupplies();
+    } catch (err) {
+      console.log(err);
+      setTxButton(BurnTxProgress.default);
+      setTxProgress(false);
+      showToast("Burn Failed!", ToastSeverity.error);
+      return;
+    }
+  };
+
+  useEffect(() => {
+    if (!walletChain) return;
+    let isSubscribed = true;
+    if (isSubscribed) setBurnTransactions([]);
+    const isTestnet = isChainTestnet(walletChain?.id);
+    let _chainObjects = [mainnet, avalanche, fantom];
+    if (isTestnet) _chainObjects = [sepolia, avalancheFuji, fantomTestnet];
+    Promise.all(ChainScanner.fetchAllTxPromises(isTestnet))
+      .then((results) => {
+        if (isSubscribed) {
+          let new_chain_results = [];
+          results.forEach((results_a, index) => {
+            new_chain_results.push(
+              results_a.map((tx) => ({
+                ...tx,
+                chain: _chainObjects[index],
+              }))
+            );
+          });
+          let res = new_chain_results.flat();
+          res = ChainScanner.sortOnlyBurnTransactions(res);
+          res = res.sort((a, b) => b.timeStamp - a.timeStamp);
+          setBurnTransactions(res);
+        }
+      })
+      .catch((err) => {
+        console.log(err);
+      });
+    return () => {
+      isSubscribed = false;
+    };
+  }, [walletChain]);
+
+  return (
+    <div>
+      <DashboardLayoutStyled className="burnpage">
+        <div className="top_conatiner burnpage" style={{ alignItems: "flex-start" }}>
+          {/* Burn Button Bar */}
+          <div className="burn_button_bar">
+            <p className="input_muted">Enter amount to Burn</p>
+            <input
+              className="input_value"
+              type="text"
+              value={burnAmount}
+              placeholder="0.00"
+              onChange={onChangeBurnAmount}
+            />
+            <Button
+              variant="outlined"
+              onClick={executeBurn}
+              startIcon={
+                txProgress ? (
+                  <CircularProgress size={20} color="inherit" />
+                ) : (
+                  <AppIcon
+                    url="/icons/fire.svg"
+                    fill={"#FF5733"} // Assuming primary color for the icon
+                    size={1.5}
+                    margin={0}
+                  />
+                )
+              }
+            >
+              <span>{txButton}</span>
+            </Button>
+            {burnTxHash && (
+              <div className="tx_links">
+                <AppTooltip
+                  title={`Check burn Transaction on chain ${walletChain?.blockExplorers?.default?.name}`}
+                >
+                  <AppExtLink
+                    url={`${walletChain?.blockExplorers?.default?.url}/tx/${burnTxHash}`}
+                    className="header_link"
+                  >
+                    Burn Tx: {prettyEthAddress(burnTxHash)}
+                  </AppExtLink>
+                </AppTooltip>
+              </div>
+            )}
+          </div>
+          {/* Burn Stats Container */}
+          <div className="burn_stats_container">
+            <p className="label">App SUPPLY</p>
+            <AppChip
+              onClick={openChainModal}
+              title={walletChain?.name || "---"}
+              endIcon={"/icons/expand_more.svg"}
+              startIcon={`/images/token/${walletChain?.nativeCurrency?.symbol}.svg`}
+            ></AppChip>
+            <AppExtLink
+              className=" supply_label"
+              url={`${suppliesChain?.blockExplorers?.default?.url}/address/${fetchAddressForChain(
+                suppliesChain?.id,
+                "newToken"
+              )}`}
+            >
+              View Contract
+            </AppExtLink>
+            <div className="supply_bar">
+              {/* Supply Bar Content */}
+            </div>
+            <div className="supply_label_list">
+              {/* Supply Label List Content */}
+            </div>
+          </div>
+        </div>
+      </DashboardLayoutStyled>
+      {/* Transaction Table */}
+      <TransactionTableStyled>
+        <BurnTxTable data={burnTransactions} priceUSD={coinData?.current_price?.usd} />
+      </TransactionTableStyled>
+      {/* Chain Selector */}
+      {/* App Toast */}
+    </div>
+  );
+};
+
+export default BurnPage;
 
